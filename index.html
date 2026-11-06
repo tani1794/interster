@@ -1,0 +1,731 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Interstellar</title>
+<link rel="icon" href="data:,">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{background:#000;color:#e8f4ff;font-family:"Hiragino Sans","Noto Sans JP",system-ui,sans-serif}
+/* body に overflow:hidden を付けると position:sticky が効かなくなるため、html は hidden・body は clip */
+html{overflow-x:hidden}
+body{width:100%;overflow-x:clip}
+
+/* 3D描画キャンバス（全ページ共通・画面固定） */
+#stage{position:fixed;inset:0;z-index:2;pointer-events:none}
+#stage canvas{display:block;width:100%;height:100%}
+
+/* 背景画像（PC/スマホ別） */
+.bg{position:absolute;inset:0;z-index:0;background:#000 no-repeat center/cover;opacity:.45}
+#p1 .bg{background-image:url(assets/top-pc.jpg);opacity:.75}
+#p3 .bg{background-image:url(assets/fifth-pc.jpg)}
+#p4 .bg{background-image:url(assets/last-pc.jpg)}
+@media (max-width:768px){
+  #p1 .bg{background-image:url(assets/top-sp.jpg);opacity:.5} /* 縦長では光柱が文字の真後ろに来るので減光 */
+  #p3 .bg{background-image:url(assets/fifth-sp.jpg)}
+  #p4 .bg{background-image:url(assets/last-sp.jpg)}
+}
+
+.page{position:relative;height:100vh;height:100svh;width:100%;overflow:hidden}
+.center{position:absolute;inset:0;z-index:3;display:flex;align-items:center;justify-content:center;text-align:center;padding:0 16px;pointer-events:none}
+h2{font-weight:300;letter-spacing:.5em;font-size:clamp(18px,4vw,48px);padding-left:.5em;line-height:1.5;overflow-wrap:anywhere;text-shadow:0 0 12px #000,0 0 28px #000}
+#p1 .center{align-items:flex-end;padding-bottom:14vh}
+#p1 .center h2{font-size:clamp(12px,1.4vw,18px);opacity:.8}
+.label{position:absolute;left:16px;right:16px;bottom:16px;z-index:3;font-size:12px;letter-spacing:.3em;opacity:.7}
+
+/* ①（2画面分）と④（3画面分）は画面を固定してスクロール量でアニメーションを進める */
+.sticky{position:sticky;top:0;height:100vh;height:100svh;width:100%;overflow:hidden}
+#p1{position:relative;height:200vh;height:200svh;width:100%}
+/* 最終ページ：縦スクロールで横スライド */
+#p4{position:relative;height:300vh;height:300svh;width:100%}
+#p4 .track{position:relative;z-index:3;display:flex;width:300%;height:100%;will-change:transform}
+#p4 .panel{width:calc(100% / 3);height:100%;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:1em;padding:0 16px;text-align:center}
+#p4 .panel p{font-size:14px;opacity:.7;letter-spacing:.2em}
+@media (max-width:768px){ h2{letter-spacing:.3em;padding-left:.3em} }
+
+/* WebGL 動作時は背景画像と文字を粒子で描くため、DOM 側は隠す（文字はレイアウトと読み上げ用に残す） */
+.webgl .bg{visibility:hidden}
+.webgl .ptxt{color:transparent;text-shadow:none}
+.no-particle-bg .bg{visibility:visible}
+.no-webgl #stage{display:none}
+.no-webgl .bg{opacity:.8}
+</style>
+<script type="importmap">
+{ "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js" } }
+</script>
+</head>
+<body>
+<div id="stage"></div>
+
+<main>
+  <section id="p1">
+    <div class="sticky">
+      <div class="bg"></div>
+      <div class="center"><h2>SURFACE</h2></div>
+      <div class="label">01 · SURFACE</div>
+    </div>
+  </section>
+
+  <section id="p3" class="page">
+    <div class="bg"></div>
+    <div class="label">02 · TESSERACT</div>
+  </section>
+
+  <section id="p4">
+    <div class="sticky">
+      <div class="bg"></div>
+      <div class="track">
+        <div class="panel"><h2>FIFTH DIMENSION</h2><p>scroll → slide</p></div>
+        <div class="panel"><h2>TIME AS SPACE</h2></div>
+        <div class="panel"><h2>BEYOND</h2></div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<script type="module">
+import * as THREE from 'three';
+
+/* ---------- 共通セットアップ ---------- */
+const stage = document.getElementById('stage');
+let renderer;
+try {
+  renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+} catch (e) {
+  document.documentElement.classList.add('no-webgl'); // WebGL 非対応時は背景画像のみ表示
+  throw e;
+}
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setClearColor(0x000000, 1);
+renderer.autoClear = false;              // 背景粒子 → 3D → 文字粒子の順に重ねて描く
+stage.appendChild(renderer.domElement);
+document.documentElement.classList.add('webgl');
+const camera = new THREE.PerspectiveCamera(50, 1, 0.1, 500);
+const ortho = new THREE.OrthographicCamera(0, 1, 0, -1, -10, 10); // CSS ピクセル座標（y は下向きに負）
+
+// スクロール中に粒子がバラける量（0〜1）。全粒子のシェーダーで共有する
+const uScatter = { value: 0 };
+const SCATTER_GLSL = /* glsl */`
+  attribute vec4 aRnd;
+  uniform float uScatter, uSpread, uLift;
+  // 粒子ごとにばらつかせた散り方。上へ舞い上がり、戻る時は下へ落ちて元の位置に収まる
+  vec3 scatterOffset() {
+    float s = clamp(uScatter * (0.45 + 0.55 * (aRnd.w * 0.5 + 0.5)) * 1.25, 0.0, 1.0);
+    s = s * s * (3.0 - 2.0 * s);
+    return vec3(aRnd.x * uSpread, (0.35 + 0.65 * (aRnd.y * 0.5 + 0.5)) * uLift, aRnd.z * uSpread) * s;
+  }`;
+function addRnd(geo) {
+  const r = new Float32Array(geo.attributes.position.count * 4);
+  for (let i = 0; i < r.length; i++) r[i] = Math.random() * 2 - 1;
+  geo.setAttribute('aRnd', new THREE.BufferAttribute(r, 4));
+  return geo;
+}
+
+const clamp = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
+const smooth = x => x * x * (3 - 2 * x);
+const isPortrait = () => innerWidth / innerHeight < 0.9;
+
+// 幅 w・高さ h の物体が画面に収まるカメラ距離（縦長画面でも切れない）
+function fitDistance(w, h, margin = 1.15) {
+  const tv = Math.tan(THREE.MathUtils.degToRad(camera.fov / 2));
+  return Math.max(h / 2 / tv, w / 2 / (tv * camera.aspect)) * margin;
+}
+
+function glowTexture() {
+  const c = document.createElement('canvas'); c.width = c.height = 128;
+  const g = c.getContext('2d');
+  const gr = g.createRadialGradient(64, 64, 0, 64, 64, 64);
+  gr.addColorStop(0, 'rgba(255,255,255,1)');
+  gr.addColorStop(0.25, 'rgba(190,230,255,0.55)');
+  gr.addColorStop(1, 'rgba(0,0,0,0)');
+  g.fillStyle = gr; g.fillRect(0, 0, 128, 128);
+  return new THREE.CanvasTexture(c);
+}
+const glowTex = glowTexture();
+
+function starfield(n, r) {
+  const g = new THREE.BufferGeometry();
+  const p = new Float32Array(n * 3);
+  for (let i = 0; i < n * 3; i++) p[i] = (Math.random() - 0.5) * r;
+  g.setAttribute('position', new THREE.BufferAttribute(p, 3));
+  // 1実画素の星（PointsMaterial の size は CSS px × pixelRatio で描かれるため割り戻す）
+  return new THREE.Points(g, new THREE.PointsMaterial({
+    color: 0xffffff, size: 1 / renderer.getPixelRatio(), sizeAttenuation: false, transparent: true, opacity: 0.8
+  }));
+}
+
+/* ---------- ① トップ：地表に敷いた横線が文字の形に盛り上がる → スクロールで吸い込まれて退場 ---------- */
+// 元画像（image-4）に文字は写っていないため仮の文字列。変更する場合はここを編集。
+const SURFACE_TEXT = 'INTERSTELLAR';
+const SURFACE_TEXT_SP = 'INTER\nSTELLAR'; // 縦長画面用の改行版
+const SINK_NDC = new THREE.Vector2(0, -0.25); // 吸い込み先：背景のブラックホールの光柱の付け根（画面中央やや下）
+
+const topScene = new THREE.Scene();
+const topGroup = new THREE.Group();
+topGroup.rotation.x = -Math.PI * 0.3;
+topScene.add(topGroup);
+
+const topMat = new THREE.ShaderMaterial({
+  transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
+  uniforms: {
+    uMorph: { value: 0 }, uTime: { value: 0 }, uPulse: { value: 0 },
+    uHeight: { value: 1.6 }, uHalf: { value: new THREE.Vector2(8, 4.5) },
+    uColor: { value: new THREE.Color(0xdcefff) },
+    uSuck: { value: 0 }, uTarget: { value: new THREE.Vector3() }, uMaxD: { value: 10 },
+    uScatter, uSpread: { value: 1.6 }, uLift: { value: 3.0 },
+  },
+  vertexShader: /* glsl */`
+    attribute float aInit; attribute float aTgt;
+    uniform float uMorph, uTime, uHeight, uSuck, uMaxD; uniform vec2 uHalf; uniform vec3 uTarget;
+    ${SCATTER_GLSL}
+    varying float vH; varying float vEdge; varying float vS;
+    void main() {
+      vec3 p = position;
+      float wave = sin(uTime * 2.0 + p.x * 2.5 + p.y * 3.0) * 0.05 * uMorph;   // 光の揺らぎ（uTime はスクロール量）
+      p.z = mix(aInit, aTgt * uHeight, uMorph) + wave;
+      vH = aTgt * uMorph;
+      vec2 e = 1.0 - abs(position.xy) / uHalf;                                // 端をフェードさせ背景画像に馴染ませる
+      vEdge = smoothstep(0.0, 0.35, e.x) * smoothstep(0.0, 0.4, e.y);
+
+      // 吸い込み：吸い込み先に近い線から順に、渦を巻きながら一点へ落ちていく
+      vec2 rel = p.xy - uTarget.xy;
+      float delay = clamp(length(rel) / uMaxD, 0.0, 1.0) * 0.55;
+      float s = smoothstep(delay, delay + 0.45, uSuck);
+      float ang = s * s * 3.2;
+      rel = mat2(cos(ang), sin(ang), -sin(ang), cos(ang)) * rel * pow(1.0 - s, 1.6);
+      p.xy = uTarget.xy + rel;
+      p.z = mix(p.z, uTarget.z, s);
+      vS = s;
+      vec4 w = modelMatrix * vec4(p, 1.0);
+      w.xyz += scatterOffset();
+      gl_Position = projectionMatrix * viewMatrix * w;
+      gl_PointSize = 1.0;                                                     // 1実画素の粒子
+    }`,
+  fragmentShader: /* glsl */`
+    uniform vec3 uColor; uniform float uPulse, uMorph;
+    varying float vH; varying float vEdge; varying float vS;
+    void main() {
+      float b = 0.3 + vH * (0.8 + 0.7 * uPulse) + 0.05 * uPulse * uMorph;   // 文字部分ほど明るく脈動（粒子は1px なので下地を明るめに）
+      b *= (1.0 + 1.6 * vS) * (1.0 - smoothstep(0.7, 1.0, vS));            // 落ちる直前に光って消える
+      // alpha=1 だと暗い線が不透明な黒になり背景画像を隠すため、明るさを alpha に入れて「光を足すだけ」にする
+      gl_FragColor = vec4(uColor, clamp(b * vEdge * 1.8, 0.0, 1.0));   // 1px 粒子でも文字が読める明るさに
+    }`,
+});
+
+let topLines = null, topSize = { w: 16, h: 9 };
+function buildTop() {
+  const portrait = isPortrait();
+  const text = portrait ? SURFACE_TEXT_SP : SURFACE_TEXT;
+  const LW = portrait ? 9 : 16, LH = portrait ? 12 : 9;
+  const ROWS = portrait ? 150 : 120, COLS = portrait ? 220 : 360;
+  const TW = portrait ? 360 : 640, TH = Math.round(TW * LH / LW);
+
+  // 文字の高さマップ（少しぼかして稜線を滑らかに）
+  const tc = document.createElement('canvas'); tc.width = TW; tc.height = TH;
+  const tg = tc.getContext('2d');
+  tg.fillStyle = '#000'; tg.fillRect(0, 0, TW, TH);
+  tg.fillStyle = '#fff'; tg.textAlign = 'center'; tg.textBaseline = 'middle';
+  const lines = text.split('\n');
+  let fs = TH * (lines.length > 1 ? 0.26 : 0.42);
+  tg.font = `bold ${fs}px "Helvetica Neue", Arial, sans-serif`;
+  const maxW = Math.max(...lines.map(l => tg.measureText(l).width));
+  if (maxW > TW * 0.86) fs *= (TW * 0.86) / maxW;
+  tg.font = `bold ${fs}px "Helvetica Neue", Arial, sans-serif`;
+  tg.filter = `blur(${Math.max(1, TW / 320)}px)`;
+  lines.forEach((l, i) => tg.fillText(l, TW / 2, TH / 2 + (i - (lines.length - 1) / 2) * fs * 1.1));
+  const px = tg.getImageData(0, 0, TW, TH).data;
+  const lumAt = (u, v) => px[(Math.round(v * (TH - 1)) * TW + Math.round(u * (TW - 1))) * 4] / 255;
+
+  const pos = new Float32Array(ROWS * COLS * 3), aInit = new Float32Array(ROWS * COLS), aTgt = new Float32Array(ROWS * COLS);
+  for (let r = 0; r < ROWS; r++) {
+    const v = r / (ROWS - 1), y = (v - 0.5) * LH;
+    for (let c = 0; c < COLS; c++) {
+      const u = c / (COLS - 1), x = (u - 0.5) * LW, i = r * COLS + c;
+      pos[i * 3] = x; pos[i * 3 + 1] = y;
+      aInit[i] = Math.sin(x * 0.6 + y * 1.3) * 0.18 + (Math.random() - 0.5) * 0.12; // 最初はほぼ平らな横線
+      aTgt[i] = lumAt(u, 1 - v);                                                   // 最終的に文字の高さ
+    }
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  g.setAttribute('aInit', new THREE.BufferAttribute(aInit, 1));
+  g.setAttribute('aTgt', new THREE.BufferAttribute(aTgt, 1));
+  addRnd(g);
+  if (topLines) { topGroup.remove(topLines); topLines.geometry.dispose(); }
+  topLines = new THREE.Points(g, topMat);   // 横線を1実画素の粒子の列として描く
+  topLines.frustumCulled = false; // 頂点をシェーダーで動かすため
+  topGroup.add(topLines);
+  topMat.uniforms.uHalf.value.set(LW / 2, LH / 2);
+  topSize = { w: LW, h: LH, portrait };
+}
+
+const glowSprite = (color) => new THREE.Sprite(new THREE.SpriteMaterial({
+  map: glowTex, blending: THREE.AdditiveBlending, transparent: true, opacity: 0, depthWrite: false, color
+}));
+const topGlow = glowSprite(0xffffff);      // 文字の背後の柔らかい光
+topGlow.position.set(0, 0, -3);
+topScene.add(topGlow);
+const sinkGlow = glowSprite(0xdff1ff);     // 吸い込み先の光
+topScene.add(sinkGlow);
+
+const ray = new THREE.Raycaster(), plane = new THREE.Plane(), hit = new THREE.Vector3(), nrm = new THREE.Vector3();
+// ①は自動では動かない。すべてスクロール量 scrollPx で決まる（2画面分のうち最初の1画面は画面固定）
+function updateTop(scrollPx) {
+  const H = innerHeight;
+  const m = smooth(clamp(scrollPx / (H * 0.5)));         // 最初の半画面分のスクロールで線が文字へ移動
+  const suck = clamp((scrollPx - H * 0.6) / (H * 0.9));  // その後、③へ切り替わる位置までに吸い込まれる
+  const pulse = 0.5 + 0.5 * Math.sin(scrollPx * 0.012);  // 光度の脈動もスクロールに連動
+  const u = topMat.uniforms;
+  u.uMorph.value = m; u.uTime.value = scrollPx * 0.01; u.uPulse.value = pulse; u.uSuck.value = suck;
+  topGlow.material.opacity = (0.1 + 0.25 * m * pulse) * (1 - suck);
+  topGlow.scale.set(topSize.w * 0.9, topSize.h * 0.6, 1);
+
+  const d = fitDistance(topSize.w, topSize.h * 0.62, topSize.portrait ? 1.05 : 1.1);
+  camera.position.set(0, d * 0.555, d * 0.832);
+  camera.lookAt(0, 0, 0);
+  camera.clearViewOffset();
+  camera.updateMatrixWorld(); topGroup.updateMatrixWorld();
+
+  // 吸い込み先：画面上の SINK_NDC から地表面へ光線を飛ばした交点（地表のローカル座標）
+  nrm.set(0, 0, 1).applyQuaternion(topGroup.quaternion);
+  plane.setFromNormalAndCoplanarPoint(nrm, topGroup.position);
+  ray.setFromCamera(SINK_NDC, camera);
+  if (ray.ray.intersectPlane(plane, hit)) {
+    sinkGlow.position.copy(hit);
+    u.uTarget.value.copy(topGroup.worldToLocal(hit));
+    u.uMaxD.value = Math.hypot(topSize.w / 2 + Math.abs(u.uTarget.value.x), topSize.h / 2 + Math.abs(u.uTarget.value.y));
+  }
+  const sg = Math.sin(Math.PI * suck);
+  sinkGlow.material.opacity = 0.9 * sg;
+  sinkGlow.scale.setScalar(topSize.w * (0.15 + 0.35 * sg));
+
+  // 画面固定が外れた後は 3D をページと一緒にスクロールさせ、背景のブラックホールと位置を合わせる
+  const off = scrollPx - H;
+  if (off > 0) camera.setViewOffset(innerWidth, innerHeight, 0, off, innerWidth, innerHeight);
+}
+
+/* ---------- ③④ 5次元空間：格子（image-3）。③は重力波の波紋、④は流れる格子＋360度カメラ ---------- */
+const fifthScene = new THREE.Scene();
+const FOG = 0.03;                                     // 遠方を闇に溶かす（格子はシェーダー内で同じ式を使う）
+fifthScene.fog = new THREE.FogExp2(0x000000, FOG);
+fifthScene.add(starfield(900, 160));
+
+// 格子：x/y の位置を不等間隔にして image-3 の密度ムラを再現
+const S = 1.4, SZ = 2.0, Z_NEAR = 40, Z_FAR = -72;   // Z_NEAR は④で後ろを向いた時に格子の端が見えない長さ
+const IDX = [-8, -6, -5, -3, -2, -1, 0, 1, 2, 3, 5, 6, 8];
+const HALF = 8 * S;
+const lat = new THREE.Group(); fifthScene.add(lat);
+
+// 重力波：奥の一点から球面状に広がる波。波頭が通ると格子が外側へたわみ、線と光点が明るくなる
+const latUniforms = {
+  uTime: { value: 0 }, uWave: { value: 0 }, uFog: { value: FOG },
+  uColor: { value: new THREE.Color(0.82, 0.92, 1.0) },
+  uScatter, uSpread: { value: 2.0 }, uLift: { value: 4.0 },
+  uGrid: { value: 0.5 }, // 断面の縦横線の明るさ倍率（④で濃くする）
+};
+const WAVE_GLSL = /* glsl */`
+  uniform float uTime, uWave, uFog;
+  const vec3 SRC = vec3(0.0, 0.0, -26.0);   // 波源（消失点の奥）
+  float wavePulse(vec3 w) {
+    float d = distance(w, SRC);
+    float ph = (d - uTime * 3.0) / 9.0;     // 速さ 3/秒、波長 9（スローモーション）
+    float c = 0.5 + 0.5 * cos(6.2831853 * ph);
+    return pow(c, 10.0) * exp(-d * 0.012) * uWave;
+  }
+  vec4 waveWorld(vec3 pos, out float pu) {
+    vec4 w = modelMatrix * vec4(pos, 1.0);
+    pu = wavePulse(w.xyz);
+    float r = length(w.xy);
+    vec2 dir = r > 1e-3 ? w.xy / r : vec2(0.0);
+    w.xy += dir * pu * 0.5 * smoothstep(0.0, 2.0, r);   // 軸から外側へたわむ
+    w.z += pu * 0.35;
+    return w;
+  }`;
+const latLineMat = new THREE.ShaderMaterial({
+  uniforms: latUniforms, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
+  vertexShader: /* glsl */`
+    attribute float aTone;
+    uniform float uGrid;
+    varying float vB; varying float vFog;
+    ${WAVE_GLSL}
+    ${SCATTER_GLSL}
+    void main() {
+      float pu; vec4 w = waveWorld(position, pu);
+      w.xyz += scatterOffset();
+      vec4 mv = viewMatrix * w;
+      gl_Position = projectionMatrix * mv;
+      gl_PointSize = 1.0;                       // 線は1実画素の粒子の列
+      vFog = exp(-pow(uFog * -mv.z, 2.0));
+      // aTone が負の粒子は断面の縦横線（印）。その線だけ uGrid 倍に濃くする
+      vB = abs(aTone) * (aTone < 0.0 ? uGrid : 1.0) * (1.0 + 2.6 * pu);
+    }`,
+  fragmentShader: /* glsl */`
+    uniform vec3 uColor; varying float vB; varying float vFog;
+    void main() {
+      gl_FragColor = vec4(uColor * vB, 0.85);
+      #include <colorspace_fragment>
+      gl_FragColor.rgb *= vFog;   // three.js 標準と同じく色空間変換の後に霧をかける（④の見た目を従来と一致させる）
+    }`,
+});
+const latPointMat = new THREE.ShaderMaterial({
+  uniforms: latUniforms, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
+  vertexShader: /* glsl */`
+    varying float vB; varying float vFog;
+    ${WAVE_GLSL}
+    ${SCATTER_GLSL}
+    void main() {
+      float pu; vec4 w = waveWorld(position, pu);
+      w.xyz += scatterOffset();
+      vec4 mv = viewMatrix * w;
+      gl_Position = projectionMatrix * mv;
+      gl_PointSize = pu > 0.3 ? 2.0 : 1.0;      // 交点の光点も極小。波頭が通る時だけ 2px に膨らむ
+      vFog = exp(-pow(uFog * -mv.z, 2.0));
+      vB = 1.0 + 2.0 * pu;
+    }`,
+  fragmentShader: /* glsl */`
+    varying float vB; varying float vFog;
+    void main() {
+      gl_FragColor = vec4(vec3(0.807, 0.922, 1.0) * vB, 1.0);
+      #include <colorspace_fragment>
+      gl_FragColor.rgb *= vFog;
+    }`,
+});
+{
+  const lp = [], lt = [], dp = [];
+  const tone = i => (i === 0 ? 1.0 : Math.abs(i) === 8 ? 0.55 : 0.32);
+  // 線を等間隔（約0.08）の粒子に分解して登録する
+  const seg = (a, b, k, n) => {
+    for (let s = 0; s <= n; s++) {
+      const f = s / n;
+      lp.push(a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f, a[2] + (b[2] - a[2]) * f); lt.push(k);
+    }
+  };
+  // 奥行き方向（消失点へ向かう）線
+  for (const xi of IDX) for (const yi of IDX) {
+    if (xi === 0 || yi === 0 || Math.abs(xi) === 8 || Math.abs(yi) === 8 || (xi + yi * 3) % 4 === 0)
+      seg([xi * S, yi * S, Z_FAR], [xi * S, yi * S, Z_NEAR], Math.max(tone(xi), tone(yi)) * 0.8, 1400);
+  }
+  // 一定間隔の断面格子（2 枚周期で模様を変える → 2*SZ ごとに継ぎ目なくループ）
+  const pick = [[-8, -5, -2, 0, 2, 5, 8], [-6, -3, -1, 0, 1, 3, 6]];
+  for (let k = 0, z = Z_NEAR; z >= Z_FAR; k++, z -= SZ) {
+    const sel = pick[k % 2];
+    for (const yi of sel) seg([-HALF, yi * S, z], [HALF, yi * S, z], -tone(yi) * 0.7, 560);   // 負の値＝断面の縦横線の印。粒子を斜線の2倍の密度で並べて濃く見せる
+    for (const xi of sel) seg([xi * S, -HALF, z], [xi * S, HALF, z], -tone(xi) * 0.7, 560);
+    for (const xi of sel) for (const yi of sel) if (xi || yi) dp.push(xi * S, yi * S, z); // 交点の光点（中心軸上は重なって白飛びするので除外）
+  }
+  const lg = new THREE.BufferGeometry();
+  lg.setAttribute('position', new THREE.Float32BufferAttribute(lp, 3));
+  lg.setAttribute('aTone', new THREE.Float32BufferAttribute(lt, 1));
+  const lines = new THREE.Points(addRnd(lg), latLineMat);
+  const dg = new THREE.BufferGeometry();
+  dg.setAttribute('position', new THREE.Float32BufferAttribute(dp, 3));
+  addRnd(dg);
+  const dots = new THREE.Points(dg, latPointMat);
+  lines.frustumCulled = dots.frustumCulled = false;
+  lat.add(lines, dots);
+}
+
+// 入れ子の立方体フレーム（④で流れる）。辺を粒子に分解し、外枠と内枠（0.5倍）を1つの粒子群にする
+const DEPTH = 120, FRAMES = 48;
+const cubeGeo = (() => {
+  const e = new THREE.EdgesGeometry(new THREE.BoxGeometry(1, 1, 1)).attributes.position.array, p = [];
+  for (const sc of [1, 0.5]) for (let i = 0; i < e.length; i += 6) for (let s = 0; s <= 40; s++) {
+    const f = s / 40;
+    for (let c = 0; c < 3; c++) p.push((e[i + c] + (e[i + 3 + c] - e[i + c]) * f) * sc);
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(p, 3));
+  return addRnd(g);
+})();
+const frames = [];
+for (let i = 0; i < FRAMES; i++) {
+  const mat = new THREE.ShaderMaterial({
+    transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
+    uniforms: { uOpacity: { value: 0 }, uFog: latUniforms.uFog, uScatter, uSpread: latUniforms.uSpread, uLift: latUniforms.uLift },
+    vertexShader: /* glsl */`
+      uniform float uFog; varying float vFog;
+      ${SCATTER_GLSL}
+      void main() {
+        vec4 w = modelMatrix * vec4(position, 1.0);
+        w.xyz += scatterOffset();
+        vec4 mv = viewMatrix * w;
+        gl_Position = projectionMatrix * mv;
+        gl_PointSize = 1.0;
+        vFog = exp(-pow(uFog * -mv.z, 2.0));
+      }`,
+    fragmentShader: /* glsl */`
+      uniform float uOpacity; varying float vFog;
+      void main() {
+        gl_FragColor = vec4(0.212, 0.686, 1.0, uOpacity);   // 0x7fd8ff（線形値）
+        #include <colorspace_fragment>
+        gl_FragColor.rgb *= vFog;
+      }`,
+  });
+  const m = new THREE.Points(cubeGeo, mat);
+  m.frustumCulled = false;
+  fifthScene.add(m);
+  frames.push({ m, mat, base: 3 + (i % 4) * 0.6, phase: i * 0.7 });
+}
+
+// ③④も自動では動かない。すべてスクロール位置で決まる
+//   flow : ③→④への移り具合（④の上端が画面下端→上端に来るまでで 0→1）
+//   p4   : ④の中のスクロール進捗（0〜1）
+function updateFifth(flow, p4) {
+  const sy = scrollY / innerHeight;                    // スクロール量（画面単位）
+  latUniforms.uTime.value = sy * 3.0;                  // 波紋はスクロールした分だけ進む
+  latUniforms.uWave.value = 1 - smooth(flow);
+  latUniforms.uGrid.value = 0.5 + 3.5 * smooth(flow); // ③は密度2倍×0.5で従来どおり、④では最大4倍に濃く
+  lat.position.z = (p4 * 30) % (SZ * 2);               // ④のスクロールで格子が奥→手前へ流れる（2*SZ 周期で継ぎ目なし）
+  const frameZ = (p4 * 90) % DEPTH;
+  const fl = smooth(flow);
+  for (let i = 0; i < FRAMES; i++) {
+    const f = frames[i];
+    const z = -DEPTH + ((i * DEPTH / FRAMES + frameZ) % DEPTH);
+    f.m.position.set(Math.sin(sy * 0.4 + f.phase) * 0.6, Math.cos(sy * 0.5 + f.phase) * 0.6, z);
+    f.m.rotation.z = f.phase + sy * 0.2;
+    f.m.scale.setScalar(f.base);
+    // 遠方では消しておき（消失点に光が溜まらないように）、近づくにつれて現れ、カメラ手前で消える
+    f.mat.uniforms.uOpacity.value = 0.3 * fl * smooth(clamp((z + 55) / 35)) * clamp((4 - z) / 4);
+  }
+}
+
+/* ---------- ページ判定・スクロール ---------- */
+const sections = {
+  top: document.getElementById('p1'),
+  fifth: document.getElementById('p3'),
+  last: document.getElementById('p4'),
+};
+const track = document.querySelector('#p4 .track');
+
+function currentKey() {
+  const mid = innerHeight / 2;
+  for (const k in sections) {
+    const r = sections[k].getBoundingClientRect();
+    if (r.top <= mid && r.bottom > mid) return k;
+  }
+  return 'top';
+}
+function lastProgress() {
+  const r = sections.last.getBoundingClientRect();
+  return clamp(-r.top / Math.max(1, r.height - innerHeight));
+}
+// 横スライドは描画ループとは別に scroll でも更新（描画が重い端末でも文字がスクロールに追従する）
+function updateTrack() { track.style.transform = `translate3d(${-lastProgress() * 200 / 3}%,0,0)`; }
+addEventListener('scroll', updateTrack, { passive: true });
+
+/* ---------- 背景画像の粒子（tools/make_particles.py が書き出した assets/particles/*.js） ---------- */
+const bgScene = new THREE.Scene();
+const BG = [
+  { name: 'top', el: document.querySelector('#p1 .sticky'), boost: { pc: 2.2, sp: 1.8 } },
+  { name: 'fifth', el: document.getElementById('p3'), boost: { pc: 2.2, sp: 2.2 } },
+  { name: 'last', el: document.querySelector('#p4 .sticky'), boost: { pc: 2.6, sp: 2.6 } },
+];
+const bgKind = () => (matchMedia('(max-width:768px)').matches ? 'sp' : 'pc');   // CSS の背景切替と同じ条件
+const bgMaterial = boost => new THREE.ShaderMaterial({
+  transparent: true, depthTest: false, depthWrite: false, blending: THREE.AdditiveBlending,
+  uniforms: { uScatter, uSpread: { value: 70 }, uLift: { value: 180 }, uBoost: { value: boost } },
+  vertexShader: /* glsl */`
+    attribute vec3 aColor; uniform float uBoost; varying vec3 vC;
+    ${SCATTER_GLSL}
+    void main() {
+      vec4 w = modelMatrix * vec4(position, 1.0);
+      w.xyz += scatterOffset();                // 散り方は画面のピクセル単位
+      gl_Position = projectionMatrix * viewMatrix * w;
+      gl_PointSize = 1.0;                      // 1実画素の粒子
+      vC = aColor * uBoost;                    // 粒子の隙間で暗く見える分を持ち上げる
+    }`,
+  fragmentShader: /* glsl */`varying vec3 vC; void main() { gl_FragColor = vec4(vC, 1.0); }`,
+});
+// file:// でも読めるよう、粒子データは通常の <script> で読み込む
+const loadScript = src => new Promise((res, rej) => {
+  const el = document.createElement('script');
+  el.src = src; el.onload = res; el.onerror = () => rej(new Error('読み込み失敗: ' + src));
+  document.head.appendChild(el);
+});
+let bgLoaded = '';
+async function loadBg(kind) {
+  if (bgLoaded === kind) return;
+  bgLoaded = kind;
+  try {
+    for (const L of BG) {
+      const key = `${L.name}-${kind}`;
+      if (!window.PARTICLE_DATA?.[key]) await loadScript(`assets/particles/${key}.js`);
+      const d = window.PARTICLE_DATA[key];
+      if (!d || !d.n) throw new Error('粒子データが空: ' + key);
+      const raw = atob(d.b64), bin = new Uint8Array(raw.length);
+      for (let i = 0; i < raw.length; i++) bin[i] = raw.charCodeAt(i);
+      const dv = new DataView(bin.buffer), pos = new Float32Array(d.n * 3), col = new Float32Array(d.n * 3);
+      for (let i = 0; i < d.n; i++) {
+        const o = i * 8;
+        pos[i * 3] = dv.getUint16(o, true) - d.w / 2 + 0.5;          // 格子座標を画像中心基準に
+        pos[i * 3 + 1] = -(dv.getUint16(o + 2, true) - d.h / 2 + 0.5);
+        col[i * 3] = bin[o + 4] / 255; col[i * 3 + 1] = bin[o + 5] / 255; col[i * 3 + 2] = bin[o + 6] / 255;
+      }
+      const g = new THREE.BufferGeometry();
+      g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+      g.setAttribute('aColor', new THREE.BufferAttribute(col, 3));
+      if (L.points) { bgScene.remove(L.points); L.points.geometry.dispose(); L.points.material.dispose(); }
+      L.points = new THREE.Points(addRnd(g), bgMaterial(L.boost[kind]));
+      L.points.frustumCulled = false;
+      L.grid = [d.w, d.h];
+      bgScene.add(L.points);
+    }
+    document.documentElement.classList.remove('no-particle-bg');
+  } catch (e) {
+    console.warn(e.message, '→ 背景は通常の画像で表示します');
+    document.documentElement.classList.add('no-particle-bg');
+  }
+  needsRender = true;
+}
+function drawBg() {
+  for (const L of BG) {
+    if (!L.points) continue;
+    const r = L.el.getBoundingClientRect();
+    if (r.bottom <= 0 || r.top >= innerHeight || r.width === 0) continue;
+    const s = Math.max(r.width / L.grid[0], r.height / L.grid[1]);   // background-size: cover と同じ拡大率
+    L.points.scale.set(s, s, 1);
+    L.points.position.set(r.left + r.width / 2, -(r.top + r.height / 2), 0);
+    for (const o of BG) if (o.points) o.points.visible = o === L;
+    renderer.setScissor(r.left, innerHeight - r.bottom, r.width, r.height); // そのページの範囲だけに描く
+    renderer.setScissorTest(true);
+    renderer.render(bgScene, ortho);
+  }
+  renderer.setScissorTest(false);
+}
+
+/* ---------- 文字の粒子（DOM の文字をレイアウトどおりの位置で1px 粒子に置き換える） ---------- */
+const textScene = new THREE.Scene();
+const TEXT_COLOR = new THREE.Vector3(0xe8 / 255, 0xf4 / 255, 1);
+const texts = [...document.querySelectorAll('h2, .label, #p4 .panel p')].map(el => ({ el, points: null }));
+texts.forEach(T => T.el.classList.add('ptxt'));
+const textMaterial = opacity => new THREE.ShaderMaterial({
+  transparent: true, depthTest: false, depthWrite: false, blending: THREE.AdditiveBlending,
+  uniforms: { uScatter, uSpread: { value: 50 }, uLift: { value: 140 }, uColor: { value: TEXT_COLOR }, uOpacity: { value: opacity } },
+  vertexShader: /* glsl */`
+    ${SCATTER_GLSL}
+    void main() {
+      vec4 w = modelMatrix * vec4(position, 1.0);
+      w.xyz += scatterOffset();
+      gl_Position = projectionMatrix * viewMatrix * w;
+      gl_PointSize = 1.0;
+    }`,
+  fragmentShader: /* glsl */`uniform vec3 uColor; uniform float uOpacity; void main() { gl_FragColor = vec4(uColor * uOpacity, 1.0); }`,
+});
+// 1文字ずつ実際の表示位置（Range の矩形）に描いて標本化する。
+// 間隔は高密度画面では2実画素（どの画面でも粒子の詰まり具合が同じになる）、等倍画面では1実画素
+function textPoints(el) {
+  const er = el.getBoundingClientRect();
+  const dpr = renderer.getPixelRatio(), k = dpr >= 2 ? dpr / 2 : 1;   // 1 CSS px あたりの標本数
+  const W = Math.ceil(er.width * k), H = Math.ceil(er.height * k);
+  if (!W || !H) return null;
+  const cs = getComputedStyle(el);
+  const c = document.createElement('canvas'); c.width = W; c.height = H;
+  const g = c.getContext('2d', { willReadFrequently: true });
+  g.scale(k, k);
+  g.font = `${cs.fontStyle} ${cs.fontWeight} ${cs.fontSize} ${cs.fontFamily}`;
+  g.textBaseline = 'middle'; g.fillStyle = '#fff';
+  const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT), range = document.createRange();
+  for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+    for (let i = 0; i < n.length; i++) {
+      const ch = n.data[i];
+      if (!ch.trim()) continue;
+      range.setStart(n, i); range.setEnd(n, i + 1);
+      const rr = range.getBoundingClientRect();
+      g.fillText(ch, rr.left - er.left, rr.top - er.top + rr.height / 2);
+    }
+  }
+  const px = g.getImageData(0, 0, W, H).data, pos = [];
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) if (px[(y * W + x) * 4 + 3] > 110) pos.push((x + 0.5) / k, -(y + 0.5) / k, 0);
+  if (!pos.length) return null;
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  const op = parseFloat(cs.opacity), boost = dpr >= 2 ? 1.6 : 1;   // 粒子の隙間で暗く見える分を補う
+  const p = new THREE.Points(addRnd(geo), textMaterial((Number.isFinite(op) ? op : 1) * boost));
+  p.frustumCulled = false;
+  return p;
+}
+function buildTexts() {
+  for (const T of texts) {
+    if (T.points) { textScene.remove(T.points); T.points.geometry.dispose(); T.points.material.dispose(); }
+    T.points = textPoints(T.el);
+    if (T.points) textScene.add(T.points);
+  }
+  needsRender = true;
+}
+function placeTexts() {
+  for (const T of texts) {
+    if (!T.points) continue;
+    const r = T.el.getBoundingClientRect();
+    T.points.visible = r.bottom > 0 && r.top < innerHeight && r.right > 0 && r.left < innerWidth;
+    T.points.position.set(r.left, -r.top, 0);
+  }
+}
+
+let needsRender = true;
+function resize() {
+  renderer.setSize(innerWidth, innerHeight, false);
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  ortho.right = innerWidth; ortho.bottom = -innerHeight; ortho.updateProjectionMatrix();
+  if (!topLines || topSize.portrait !== isPortrait()) buildTop();
+  updateTrack();
+  buildTexts();
+  loadBg(bgKind());
+  needsRender = true;
+}
+addEventListener('resize', resize);
+resize();
+document.fonts?.ready.then(buildTexts);   // Web フォントの読み込み後に文字粒子を作り直す
+
+/* ---------- 描画（自動では動かない：スクロールした時と、その後バラけた粒子が戻る間だけ描き直す） ---------- */
+const LAST_R = 8, LAST_CZ = -2, LAST_YAW = 0.45; // ④のカメラ（半径・中心Z・振れ幅 約±26度）
+let lastY = scrollY, lastNow = performance.now();
+
+function render() {
+  renderer.setScissorTest(false);
+  renderer.clear();
+  drawBg();
+
+  const key = currentKey();
+  if (key === 'top') {
+    updateTop(Math.max(0, -sections.top.getBoundingClientRect().top));
+    renderer.render(topScene, camera);
+  } else {
+    camera.clearViewOffset();
+    const p4 = lastProgress();
+    updateFifth(clamp((innerHeight - sections.last.getBoundingClientRect().top) / innerHeight), p4);
+    if (key === 'last') {
+      const th = Math.sin(p4 * Math.PI * 2) * LAST_YAW;   // スライドに合わせて左右へ振れる（始点と終点は正面）
+      camera.position.set(LAST_R * Math.sin(th), 0, LAST_CZ + LAST_R * Math.cos(th));
+      camera.lookAt(0, 0, LAST_CZ);
+    } else {
+      camera.position.set(0, 0, 6); camera.lookAt(0, 0, -10);
+    }
+    renderer.render(fifthScene, camera);
+  }
+
+  placeTexts();
+  renderer.render(textScene, ortho);
+}
+
+function frame(now) {
+  const dt = Math.min(0.5, Math.max(0, (now - lastNow) / 1000)); lastNow = now;   // 描画が遅い端末でも戻る速さは実時間どおり
+  const dy = scrollY - lastY; lastY = scrollY;
+  // スクロール速度でバラける量を決める（1800px/秒で最大）。止めると約1.5秒で下へ戻って集まる
+  const target = dt > 0 ? clamp(Math.abs(dy) / (dt * 1800)) : 0;
+  const prev = uScatter.value;
+  uScatter.value += (target - prev) * (1 - Math.exp(-dt * (target > prev ? 12 : 2.2)));
+  if (target === 0 && uScatter.value < 0.002) uScatter.value = 0;
+  if (dy !== 0 || uScatter.value !== prev || needsRender) {
+    updateTrack();
+    render();
+    needsRender = false;
+  }
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+window.__scatter = () => uScatter.value;   // 検証用（tools/check.mjs）
+</script>
+</body>
+</html>
